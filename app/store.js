@@ -235,8 +235,133 @@ class SheetStore extends Emitter {
   }
 }
 
+/* ---------------------------------------------------------- Google 帳號登入（第 2 版後端） */
+// 後端回傳 {pid: {best, verdict, tries, last, lastVerdict}} → 介面使用的格式
+function convResults(r) {
+  const out = {};
+  for (const pid in r || {}) {
+    const x = r[pid];
+    out[pid] = { tries: x.tries, best: { verdict: x.verdict, score: Math.max(0, x.best), at: x.last }, last: { verdict: x.lastVerdict, at: x.last } };
+  }
+  return out;
+}
+class AccountStore extends Emitter {
+  constructor(url, cfg) {
+    super();
+    this.url = url; this.cfg = cfg;
+    this.mode = 'account'; this.label = 'Google 試算表';
+    this.token = LS.get('aj.token', '');
+    this.cid = LS.get('aj.cid', '');
+    this.user = null;
+    this.refresh();
+  }
+  refresh() {
+    const u = this.user;
+    this.isTeacher = !!u && u.role === 'teacher';
+    this.canSubmit = !!u && u.role === 'student';
+    this.loggedIn = !!u;
+    const c = u && u.classes && (u.classes.find(x => x.cid === this.cid) || u.classes[0]);
+    this.klass = c || null;
+    this.profile = c ? { cls: c.cname, seat: c.seat, name: c.name } : null;
+    this.detail = !u ? '還沒有登入：可以練習，但送出的成績不會記錄' : u.role === 'teacher' ? `老師帳號 ${u.email}` : u.role === 'student' ? `${u.email}（成績會寫入老師的 Google 試算表）` : `${u.email} 還沒有加入班級`;
+  }
+  async api(path, body) {
+    let lastErr = '';
+    for (let i = 0; i < 4; i++) {
+      if (i) await new Promise(r => setTimeout(r, 700 * i));
+      let text;
+      try {
+        const r = await fetch(this.url, { method: 'POST', redirect: 'follow', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ path, body: body || {}, token: this.token }) });
+        text = await r.text();
+      } catch (e) { lastErr = '無法連線到後端，請檢查網路後再試一次'; if (path === '/api/submit') break; continue; }
+      let j;
+      try { j = JSON.parse(text); } catch (e) {
+        // Google 偶爾把 POST 轉成 GET（只回「API 運作中」），請求沒有被處理，可以安全重送
+        lastErr = 'Google 伺服器暫時忙碌，請稍等幾秒再試一次';
+        if (/API 運作中/.test(text)) continue;
+        if (path === '/api/submit') break;
+        continue;
+      }
+      if (!j.ok) {
+        if (j.status === 401 && path !== '/api/login') this.forget();
+        const err = new Error(j.error || '伺服器錯誤'); err.status = j.status; throw err;
+      }
+      return j.data;
+    }
+    throw new Error(lastErr);
+  }
+  forget() {
+    this.token = ''; this.user = null; this.results = {}; this.klassCfg = null;
+    LS.set('aj.token', '');
+    this.refresh();
+    this.emit('mine', {}); this.emit('user', null);
+  }
+  apply(d) {
+    if (d.token) { this.token = d.token; LS.set('aj.token', d.token); }
+    if (d.user) this.user = d.user;
+    if (d.cid) { this.cid = d.cid; LS.set('aj.cid', d.cid); }
+    this.klassCfg = d.klass || (this.user && this.user.role === 'student' ? this.klassCfg : null);
+    this.refresh();
+    if (d.results) { this.results = convResults(d.results); this.emit('mine', this.results); }
+    this.emit('user', this.user);
+  }
+  async init() {
+    this.results = {};
+    try { this.problems = await this.api('/api/problems'); }
+    catch (e) { this.problems = []; this.error = '無法連到 Google 試算表：' + e.message; }
+    this.emit('problems', this.problems);
+    if (this.token) {
+      try { this.apply(await this.api('/api/me', { cid: this.cid })); }
+      catch (e) { if (e.status === 401) this.forget(); }
+    }
+  }
+  async login(credential) { this.apply(await this.api('/api/login', { credential, cid: this.cid })); }
+  logout() { this.forget(); }
+  async join(code, seat, name) { this.apply(await this.api('/api/join', { code, seat, name })); }
+  async switchClass(cid) { this.cid = cid; LS.set('aj.cid', cid); this.refresh(); this.apply(await this.api('/api/me', { cid })); }
+  async setProfile() { /* 帳號模式的姓名座號由班級名單決定 */ }
+  async submit(pid, rec, title) {
+    const d = await this.api('/api/submit', { cid: this.cid, pid, title, verdict: rec.verdict, score: rec.score, code: rec.code || '' });
+    this.apply(d);
+  }
+  // 成績總表：讀老師所有班級
+  watchAll() {
+    const load = async () => {
+      try {
+        this.classes = await this.api('/api/classes');
+        const rows = [];
+        for (const c of this.classes.filter(c => !c.archived)) {
+          const sb = await this.api('/api/scoreboard', { cid: c.id });
+          sb.forEach(s => rows.push({ key: c.id + ':' + s.seat, cid: c.id, cls: c.name, seat: s.seat, name: s.name, email: s.email, results: convResults(s.results) }));
+        }
+        this.emit('all', rows);
+      } catch (e) { this.emit('allError', e.message); }
+    };
+    load();
+    this.reloadAll = load;
+    return () => {};
+  }
+  async loadCode(cid, seat, pid) {
+    const list = await this.api('/api/submissions', { cid, seat, pid });
+    return list[list.length - 1] || null;
+  }
+  async saveProblem(p, solution) {
+    await this.api('/api/problems/save', { problem: p, solution });
+    const i = this.problems.findIndex(x => x.id === p.id);
+    if (i >= 0) this.problems[i] = p; else this.problems.push(p);
+    this.emit('problems', this.problems);
+  }
+  async deleteProblem(id) {
+    await this.api('/api/problems/delete', { id });
+    this.problems = this.problems.filter(x => x.id !== id);
+    this.emit('problems', this.problems);
+  }
+  async getSolution(id) { return (await this.api('/api/solution', { id })) || null; }
+}
+
 AJ.createStore = async function () {
   const cfg = G.AJ_CONFIG || {};
+  if (cfg.appsScriptUrl && cfg.googleClientId) return new AccountStore(cfg.appsScriptUrl, cfg);
   if (cfg.appsScriptUrl) return new SheetStore(cfg.appsScriptUrl);
   if (G.claude && typeof G.claude.use === 'function') {
     try {

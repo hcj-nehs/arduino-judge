@@ -67,11 +67,24 @@ const S = {
   builtin: AJ.BUILTIN_PROBLEMS, custom: [], problems: [],
   mine: {}, profile: null, expected: new Map(), all: [], judging: false,
 };
+const unitOf = p => p.unit || (p.builtin ? '' : 'x');
+const unitName = u => ((AJ.UNITS || []).find(x => x.id === u) || {}).name || (u === 'x' ? '老師出的題目' : '其他');
 function rebuildProblems() {
   const custom = (S.custom || []).slice().sort((a, b) => (a.created || 0) - (b.created || 0));
-  S.problems = S.builtin.map(p => Object.assign({ builtin: true }, p)).concat(custom);
+  const order = (AJ.UNITS || []).map(u => u.id).concat(['x']);
+  const all = S.builtin.map(p => Object.assign({ builtin: true }, p)).concat(custom);
+  all.forEach((p, i) => { p._i = i; });
+  all.sort((a, b) => (order.indexOf(unitOf(a)) - order.indexOf(unitOf(b))) || (a.builtin && b.builtin ? (a.level - b.level) || (a._i - b._i) : a._i - b._i));
+  // 學生只看得到本班開放的題目（老師看得到全部）
+  const st = S.store;
+  const kc = st && st.mode === 'account' && st.user && st.user.role === 'student' ? st.klassCfg : null;
+  S.hidden = new Set(kc ? kc.hidden : []);
+  S.required = new Set(kc ? kc.required : []);
+  S.allProblems = all;
+  S.problems = all.filter(p => !S.hidden.has(p.id));
 }
-const problemById = id => S.problems.find(p => p.id === id);
+const problemById = id => S.problems.find(p => p.id === id) || (S.allProblems || []).find(p => p.id === id && !S.hidden.has(id));
+const reqMark = id => S.required && S.required.has(id) ? '<span title="老師指定的必做題" style="color:var(--accent)">⭐</span> ' : '';
 function getExpected(p) {
   if (p.expected) return Promise.resolve(p.expected);
   if (S.expected.has(p.id)) return S.expected.get(p.id);
@@ -93,6 +106,7 @@ function shell() {
       <button class="tab" role="tab" data-view="play">自由練習</button>
       <button class="tab" role="tab" data-view="grades" hidden>成績總表</button>
       <button class="tab" role="tab" data-view="author" hidden>出題管理</button>
+      <button class="tab" role="tab" data-view="classes" hidden>班級管理</button>
     </nav>
     <div class="top-right">
       <span class="chip" id="store-chip" title=""><span class="dot"></span><span>連線中…</span></span>
@@ -104,9 +118,10 @@ function shell() {
     <section id="v-play" hidden></section>
     <section id="v-grades" hidden></section>
     <section id="v-author" hidden></section>
+    <section id="v-classes" hidden></section>
   </main>`;
   $$('.tab').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
-  $('#who').addEventListener('click', () => profileDialog());
+  $('#who').addEventListener('click', () => (S.store && S.store.mode === 'account' ? accountDialog() : profileDialog()));
 }
 function setView(v) {
   if (S.view === v && S.viewInit) return;
@@ -114,12 +129,13 @@ function setView(v) {
   S.view = v;
   LS.set('aj.view', v);
   $$('.tab').forEach(b => b.setAttribute('aria-selected', b.dataset.view === v ? 'true' : 'false'));
-  ['problems', 'play', 'grades', 'author'].forEach(k => { $('#v-' + k).hidden = k !== v; });
+  ['problems', 'play', 'grades', 'author', 'classes'].forEach(k => { $('#v-' + k).hidden = k !== v; });
   if (v !== 'problems' && PV.lab) PV.lab.stop();
   if (v !== 'play' && PL.lab) PL.lab.stop();
   if (v === 'play') PL.init();
   if (v === 'grades') GV.render();
   if (v === 'author') AV.render();
+  if (v === 'classes') CV.render();
 }
 function updateChrome() {
   const st = S.store;
@@ -131,9 +147,123 @@ function updateChrome() {
   }
   const teacherTabs = st && (st.isTeacher || st.mode === 'sheet');
   $$('.tab[data-view="grades"], .tab[data-view="author"]').forEach(b => { b.hidden = !teacherTabs; });
+  $('.tab[data-view="classes"]').hidden = !(st && st.mode === 'account' && st.isTeacher);
   const p = S.profile;
-  $('#who').textContent = p && (p.name || p.seat) ? `${p.cls || ''}${p.cls && p.seat ? '・' : ''}${p.seat ? p.seat + ' 號' : ''} ${p.name || ''}`.trim() : '設定身分';
+  const who = p => `${p.cls || ''}${p.cls && p.seat ? '・' : ''}${p.seat ? p.seat + ' 號' : ''} ${p.name || ''}`.trim();
+  if (st && st.mode === 'account') {
+    const u = st.user;
+    if (!st.error) chip.className = 'chip ' + (u && u.role !== 'guest' ? 'ok' : 'warn');
+    $('#who').textContent = !u ? 'Google 登入' : u.role === 'teacher' ? `老師 ${u.email.split('@')[0]}` : u.role === 'guest' ? '加入班級' : who(st.profile || {});
+    return;
+  }
+  $('#who').textContent = p && (p.name || p.seat) ? who(p) : '設定身分';
 }
+
+/* ---------------------------------------------------------- Google 帳號登入 */
+let gsiLoading = null;
+function loadGsi() {
+  if (window.google && google.accounts && google.accounts.id) return Promise.resolve();
+  if (gsiLoading) return gsiLoading;
+  gsiLoading = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.async = true;
+    s.onload = () => res();
+    s.onerror = () => { gsiLoading = null; rej(new Error('Google 登入元件載入失敗，請檢查網路')); };
+    document.head.appendChild(s);
+  });
+  return gsiLoading;
+}
+// 登入；登入後如果還沒有班級，接著請學生加入班級。回傳 true = 已經可以使用
+function loginDialog(reason) {
+  const st = S.store;
+  return new Promise(resolve => {
+    const cfg = st.cfg || {};
+    const d = openDialog(`<div class="card-h"><h2>登入</h2><span class="spacer"></span><button class="btn small" data-x>取消</button></div>
+      <div class="card-b" style="align-items:center;text-align:center">
+        <p style="margin:0">${esc(reason || '用學校的 Google 帳號登入，成績會自動記錄。')}</p>
+        <div id="gbtn" style="min-height:44px"><span class="muted">載入 Google 登入按鈕…</span></div>
+        ${cfg.devLogin ? '<div class="row" style="justify-content:center"><input id="dev-mail" placeholder="測試用 Email" style="width:220px" class="btn"><button class="btn" data-dev>測試登入</button></div>' : ''}
+        <p class="hint" data-msg style="margin:0">第一次登入後，輸入老師給的「班級代碼」、座號、姓名，之後就不用再填。</p>
+      </div>`);
+    let done = false;
+    const finish = async credential => {
+      const msg = $('[data-msg]', d.el);
+      msg.textContent = '登入中…';
+      try {
+        await st.login(credential);
+        done = true; d.close();
+        updateChrome();
+        if (st.user.role === 'guest') resolve(await joinDialog());
+        else { toast(st.user.role === 'teacher' ? '已用老師帳號登入' : `歡迎，${st.profile.name}`); resolve(true); }
+      } catch (e) { msg.textContent = '登入失敗：' + e.message; msg.style.color = 'var(--wa)'; }
+    };
+    d.el.onclose = () => { if (!done) resolve(false); };
+    $('[data-x]', d.el).addEventListener('click', () => { d.close(); resolve(false); });
+    if (cfg.devLogin) $('[data-dev]', d.el).addEventListener('click', () => finish('dev:' + $('#dev-mail', d.el).value.trim()));
+    if (cfg.devLogin) { $('#gbtn', d.el).innerHTML = '<span class="muted">（本機測試：請用下方的測試登入）</span>'; return; }
+    loadGsi().then(() => {
+      google.accounts.id.initialize({ client_id: cfg.googleClientId, callback: r => finish(r.credential), ux_mode: 'popup' });
+      const box = $('#gbtn', d.el);
+      box.innerHTML = '';
+      google.accounts.id.renderButton(box, { theme: 'filled_blue', size: 'large', text: 'signin_with', shape: 'pill', locale: 'zh-TW', width: 260 });
+    }).catch(e => { if (!cfg.devLogin) $('#gbtn', d.el).innerHTML = `<span style="color:var(--wa)">${esc(e.message)}</span>`; else $('#gbtn', d.el).innerHTML = ''; });
+  });
+}
+function joinDialog() {
+  const st = S.store;
+  return new Promise(resolve => {
+    const d = openDialog(`<div class="card-h"><h2>加入班級</h2><span class="spacer"></span><button class="btn small" data-x>稍後再說</button></div>
+      <form class="card-b" id="jn-form">
+        <p class="hint" style="margin:0">登入帳號：${esc(st.user.email)}。請輸入老師給的班級代碼，以及你的座號和姓名。</p>
+        <div class="row"><div class="field"><label for="jn-code">班級代碼</label><input id="jn-code" required autocapitalize="characters" maxlength="6" style="text-transform:uppercase;letter-spacing:.15em;font-family:var(--font-code)"></div>
+        <div class="field" style="flex:0 1 90px"><label for="jn-seat">座號</label><input id="jn-seat" required inputmode="numeric"></div></div>
+        <div class="field"><label for="jn-name">姓名</label><input id="jn-name" required value="${esc(st.user.googleName || '')}"></div>
+        <p class="hint" data-msg style="margin:0"></p>
+        <div class="row"><span class="spacer"></span><button class="btn primary" type="submit">加入</button></div>
+      </form>`);
+    let done = false;
+    d.el.onclose = () => { if (!done) resolve(false); };
+    $('[data-x]', d.el).addEventListener('click', () => { d.close(); resolve(false); });
+    $('#jn-form', d.el).addEventListener('submit', async e => {
+      e.preventDefault();
+      const msg = $('[data-msg]', d.el);
+      msg.textContent = '加入中…'; msg.style.color = '';
+      try {
+        await st.join($('#jn-code', d.el).value.trim(), +$('#jn-seat', d.el).value, $('#jn-name', d.el).value.trim());
+        done = true; d.close();
+        S.profile = st.profile; updateChrome();
+        toast(`已加入 ${st.profile.cls}，${st.profile.seat} 號 ${st.profile.name}`);
+        resolve(true);
+      } catch (err) { msg.textContent = err.message; msg.style.color = 'var(--wa)'; }
+    });
+  });
+}
+function accountDialog() {
+  const st = S.store, u = st.user;
+  if (!u) return loginDialog();
+  if (u.role === 'guest') return joinDialog();
+  const classes = u.classes || [];
+  const d = openDialog(`<div class="card-h"><h2>我的帳號</h2><span class="spacer"></span><button class="btn small" data-x>關閉</button></div>
+    <div class="card-b">
+      <div><b>${esc(u.email)}</b> <span class="tag">${u.role === 'teacher' ? '老師' : '學生'}</span></div>
+      ${classes.length ? `<div class="field"><label for="ac-cls">目前的班級</label><select id="ac-cls">${classes.map(c => `<option value="${esc(c.cid)}"${st.klass && c.cid === st.klass.cid ? ' selected' : ''}>${esc(c.cname)}・${c.seat} 號 ${esc(c.name)}</option>`).join('')}</select></div>` : ''}
+      ${u.role === 'teacher' ? '<p class="hint" style="margin:0">老師帳號可以練習和判題，但不會記錄成績。管理班級請到「班級管理」。</p>' : '<p class="hint" style="margin:0">座號、姓名寫錯時，請老師在「班級管理」修改。</p>'}
+      <div class="row">${u.role === 'student' ? '<button class="btn" data-join>加入其他班級</button>' : ''}<span class="spacer"></span><button class="btn danger" data-out>登出</button></div>
+    </div>`);
+  $('[data-x]', d.el).addEventListener('click', d.close);
+  const sel = $('#ac-cls', d.el);
+  if (sel) sel.addEventListener('change', async () => { try { await st.switchClass(sel.value); S.profile = st.profile; updateChrome(); toast('已切換班級'); } catch (e) { toast(e.message); } });
+  const jb = $('[data-join]', d.el);
+  if (jb) jb.addEventListener('click', () => { d.close(); joinDialog(); });
+  $('[data-out]', d.el).addEventListener('click', () => {
+    d.close(); st.logout(); S.profile = null;
+    try { google.accounts.id.disableAutoSelect(); } catch (e) { /* 沒有載入 */ }
+    updateChrome(); toast('已登出');
+    if (['grades', 'author', 'classes'].includes(S.view)) setView('problems');
+  });
+}
+
 function profileDialog() {
   return new Promise(resolve => {
     const p = S.profile || {};
@@ -327,13 +457,17 @@ const PV = {
   },
   renderPicker() {
     const list = $('.picker-list', this.lab.top);
-    const row = (p, i) => `<button class="prow" data-id="${esc(p.id)}" ${p.id === S.pid ? 'aria-current="true"' : ''}><span class="no">${String(i + 1).padStart(2, '0')}</span><span class="tt">${esc(p.title)} <span class="level">${stars(p.level)}</span></span><span>${this.statusChip(p.id)}</span></button>`;
+    const row = (p, i) => `<button class="prow" data-id="${esc(p.id)}" ${p.id === S.pid ? 'aria-current="true"' : ''}><span class="no">${String(i + 1).padStart(2, '0')}</span><span class="tt">${reqMark(p.id)}${esc(p.title)} <span class="level">${stars(p.level)}</span></span><span>${this.statusChip(p.id)}</span></button>`;
     let html = '';
-    const LN = AJ.LEVEL_NAMES || {};
+    if (S.required && S.required.size) {
+      const req = S.problems.filter(p => S.required.has(p.id));
+      const done = req.filter(p => S.mine[p.id] && S.mine[p.id].best && S.mine[p.id].best.verdict === 'AC').length;
+      html += `<div class="group-label" style="color:var(--accent)">⭐ 老師指定必做題　已完成 ${done} / ${req.length}</div>`;
+      req.forEach(p => { html += row(p, S.problems.indexOf(p)); });
+    }
     S.problems.forEach((p, i) => {
       const prev = S.problems[i - 1];
-      if (p.builtin && (!prev || prev.level !== p.level)) html += `<div class="group-label">${esc(LN[p.level] || '')} ${stars(p.level)}</div>`;
-      if (!p.builtin && (!prev || prev.builtin)) html += '<div class="group-label">老師出的題目</div>';
+      if (!prev || unitOf(prev) !== unitOf(p)) html += `<div class="group-label">${esc(unitName(unitOf(p)))}</div>`;
       html += row(p, i);
     });
     list.innerHTML = html;
@@ -375,7 +509,7 @@ const PV = {
     const circuitHtml = p.circuit.length ? `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>元件</th><th>腳位</th><th>接法</th></tr></thead><tbody>${
       p.circuit.map(c => `<tr><td>${esc(c.label || AJ.TYPE_NAMES[c.type])} <span class="muted" style="font-size:12px">${esc(c.id)}</span></td><td>${AJ.pinChips(c)}</td><td>${esc(AJ.wiringText(c))}</td></tr>`).join('')
     }</tbody></table></div>` : '<p class="muted" style="margin:0">這題不需要外接元件，只使用序列埠。</p>';
-    el.innerHTML = `<div class="ptitle"><span class="muted" style="font-family:var(--font-code)">#${String(idx + 1).padStart(2, '0')}</span><h1>${esc(p.title)}</h1><span class="level" title="難度">${stars(p.level)}</span>${(p.tags || []).map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div>
+    el.innerHTML = `<div class="ptitle"><span class="muted" style="font-family:var(--font-code)">#${String(idx + 1).padStart(2, '0')}</span><h1>${esc(p.title)}</h1>${S.required && S.required.has(p.id) ? '<span class="tag" style="color:var(--accent);border-color:var(--accent)">⭐ 必做</span>' : ''}<span class="level" title="難度">${stars(p.level)}</span>${(p.tags || []).map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div>
       <div class="desc">${md(p.desc)}</div>
       <div class="sub">電路接線</div>${circuitHtml}
       <div class="sub">範例測資</div><div data-samples>${samples.length ? '<p class="muted">產生範例輸出中…</p>' : '<p class="muted">這題沒有公開的範例測資。</p>'}</div>
@@ -403,7 +537,11 @@ const PV = {
     if (S.judging) return;
     const p = problemById(S.pid);
     if (!p) return;
-    if (S.store && S.store.canSubmit && !(S.profile && (S.profile.name || S.profile.seat))) {
+    if (S.store && S.store.mode === 'account') {
+      const u = S.store.user;
+      if (!u) { if (!(await loginDialog('登入後送出的成績才會記錄。也可以按「取消」只看判題結果。')) && !S.store.user) { /* 不登入也能判題，只是不記錄 */ } }
+      else if (u.role === 'guest') await joinDialog();
+    } else if (S.store && S.store.canSubmit && !(S.profile && (S.profile.name || S.profile.seat))) {
       const pf = await profileDialog();
       if (!pf) { toast('需要先填寫班級座號姓名才能記錄成績'); return; }
     }
@@ -428,7 +566,7 @@ const PV = {
     S.judging = false;
     if (res.verdict === 'CE') lab.showCE({ line: res.ce.line, message: res.ce.msg });
     const note = $('[data-note]', card);
-    if (!S.store || !S.store.canSubmit) { note.textContent = S.store ? S.store.detail : '尚未連線，這次的結果沒有記錄。'; return; }
+    if (!S.store || !S.store.canSubmit) { note.textContent = !S.store ? '尚未連線，這次的結果沒有記錄。' : S.store.isTeacher ? '老師帳號的練習不會記錄成績。' : S.store.detail; return; }
     try {
       await S.store.submit(p.id, { verdict: res.verdict, score: res.score, at: Date.now(), code: code.slice(0, 12000) }, p.title);
       note.textContent = S.store.mode === 'claude' ? '成績已記錄在 Claude 雲端（Artifact 版不會寫入 Google 試算表，老師可在「成績總表」查看）。' : `成績已記錄（${S.store.label}）。`;
@@ -632,11 +770,11 @@ const GV = {
     const st = S.store;
     if (!st) { host.innerHTML = '<div class="card"><div class="empty">連線中…</div></div>'; return; }
     if (st.mode === 'sheet' && !st.isTeacher) { host.innerHTML = loginCard(); bindLogin(host, () => { updateChrome(); this.render(); }); return; }
-    if (!st.isTeacher) { host.innerHTML = '<div class="card"><div class="empty">只有老師可以看成績總表。</div></div>'; return; }
+    if (!st.isTeacher) { teacherOnly(host, '成績總表', () => this.render()); return; }
     host.innerHTML = `<section class="card">
       <div class="card-h"><h2>成績總表</h2><span class="muted" style="font-size:13px">${esc(st.label)}</span><span class="spacer"></span>
         <label class="muted" for="g-cls" style="font-size:13px">班級</label><select id="g-cls" class="btn small"></select>
-        ${st.mode === 'sheet' ? '<button class="btn small" data-reload>重新整理</button>' : ''}
+        ${st.mode === 'sheet' || st.mode === 'account' ? '<button class="btn small" data-reload>重新整理</button>' : ''}
         <button class="btn small" data-csv>複製成 CSV</button>
         ${st.mode === 'sheet' ? '<button class="btn small" data-logout>教師登出</button>' : ''}</div>
       <div class="card-b"><div class="stat" data-stat></div>${st.mode === 'local' ? '<p class="hint">本機模式只會看到這台電腦自己的成績。要收全班成績，請參考使用說明設定 Google 試算表，或使用 Claude 雲端版。</p>' : ''}</div>
@@ -698,9 +836,15 @@ const GV = {
     const d = openDialog(`<div class="card-h"><h2>${esc(r.cls || '')} ${esc(r.seat || '')} 號 ${esc(r.name || names[key] || '')}・${esc(p ? p.title : pid)}</h2><span class="spacer"></span><button class="btn small" data-x>關閉</button></div>
       <div class="card-b"><div class="row" style="align-items:center">最佳 ${vchip(x.best.verdict)} ${x.best.score} 分　最後一次 ${last.verdict ? vchip(last.verdict) : ''} ${last.score != null ? last.score + ' 分' : ''}　共送出 ${x.tries || 1} 次</div>
       <div class="hint">最後送出：${esc(last.at ? fmtTime(last.at) : '')}</div>
-      ${last.code ? `<pre class="out" style="max-height:50vh;overflow:auto">${AJ.highlight(last.code)}</pre><div class="row"><span class="spacer"></span><button class="btn small" data-copy>複製程式碼</button></div>` : '<p class="muted">沒有保存程式碼。</p>'}</div>`, true);
+      <div data-code>${last.code ? '' : S.store.loadCode ? '<p class="muted">讀取程式碼中…</p>' : '<p class="muted">沒有保存程式碼。</p>'}</div></div>`, true);
     $('[data-x]', d.el).addEventListener('click', d.close);
-    const cp = $('[data-copy]', d.el); if (cp) cp.addEventListener('click', () => copyText(last.code));
+    const showCode = code => {
+      const box = $('[data-code]', d.el);
+      box.innerHTML = code ? `<pre class="out" style="max-height:50vh;overflow:auto">${AJ.highlight(code)}</pre><div class="row"><span class="spacer"></span><button class="btn small" data-copy>複製程式碼</button></div>` : '<p class="muted">沒有保存程式碼。</p>';
+      const cp = $('[data-copy]', box); if (cp) cp.addEventListener('click', () => copyText(code));
+    };
+    if (last.code) showCode(last.code);
+    else if (S.store.loadCode) S.store.loadCode(r.cid, r.seat, pid).then(s => showCode(s && s.code)).catch(e => { $('[data-code]', d.el).innerHTML = `<p class="muted">讀取失敗：${esc(e.message)}</p>`; });
   },
   csv() {
     const rows = this.rows(), P = S.problems;
@@ -714,6 +858,12 @@ const GV = {
     return '﻿' + lines.join('\r\n');
   },
 };
+function teacherOnly(host, what, again) {
+  const st = S.store;
+  host.innerHTML = `<div class="card"><div class="empty">只有老師可以使用${what}。${st.mode === 'account' && !st.user ? '<br><br><button class="btn primary" data-li>用老師的 Google 帳號登入</button>' : ''}</div></div>`;
+  const b = $('[data-li]', host);
+  if (b) b.addEventListener('click', async () => { await loginDialog('請用老師的 Google 帳號登入。'); updateChrome(); again(); });
+}
 function loginCard() {
   return `<section class="card" style="max-width:440px;margin:24px auto"><div class="card-h"><h2>教師登入</h2></div>
     <form class="card-b" data-login><div class="field"><label for="t-key">教師密碼</label><input id="t-key" type="password" autocomplete="current-password" required></div>
@@ -736,13 +886,14 @@ const AV = {
     const st = S.store;
     if (!st) { host.innerHTML = '<div class="card"><div class="empty">連線中…</div></div>'; return; }
     if (st.mode === 'sheet' && !st.isTeacher) { host.innerHTML = loginCard(); bindLogin(host, () => { updateChrome(); this.render(); }); return; }
-    if (!st.isTeacher) { host.innerHTML = '<div class="card"><div class="empty">只有老師可以出題。</div></div>'; return; }
+    if (!st.isTeacher) { teacherOnly(host, '出題', () => this.render()); return; }
     host.innerHTML = `<div class="authoring">
-      <section class="card"><div class="card-h"><h2>我的題目</h2><span class="spacer"></span><button class="btn small primary" data-new>${I.plus}新題目</button></div>
+      <section class="card"><div class="card-h"><h2>我的題目</h2><span class="spacer"></span><button class="btn small" data-import>匯入題目</button><button class="btn small primary" data-new>${I.plus}新題目</button></div>
         <div class="card-b plist" data-list></div>
         <div class="card-b" style="border-top:1px solid var(--line)"><div class="field"><label for="a-copy">從範例題目複製</label><select id="a-copy"><option value="">選一題範例…</option>${S.builtin.map(p => `<option value="${esc(p.id)}">${esc(p.title)}</option>`).join('')}</select></div></div></section>
       <section class="card" data-form><div class="empty">選擇左邊的題目來編輯，或按「新題目」。<br>也可以從範例題目複製一份再修改。</div></section></div>`;
     $('[data-new]', host).addEventListener('click', () => this.edit(this.blank()));
+    $('[data-import]', host).addEventListener('click', () => this.importDialog());
     $('#a-copy', host).addEventListener('change', e => {
       const b = S.builtin.find(p => p.id === e.target.value);
       if (!b) return;
@@ -785,6 +936,7 @@ const AV = {
         <button class="btn" data-try>${I.play}試跑參考解答</button><button class="btn primary" data-save>${I.check}儲存並發佈</button>${d.isNew ? '' : '<button class="btn danger" data-del>刪除</button>'}</div>
       <div class="card-b" style="display:flex;flex-direction:column;gap:14px">
         <div class="row"><div class="field" style="flex:3 1 240px"><label for="a-title">標題</label><input id="a-title" value="${esc(d.title)}" placeholder="例如：呼吸燈"></div>
+          <div class="field"><label for="a-unit">單元</label><select id="a-unit">${(AJ.UNITS || []).concat([{ id: 'x', name: '老師出的題目' }]).map(u => `<option value="${u.id}"${u.id === (d.unit || 'x') ? ' selected' : ''}>${esc(u.name)}</option>`).join('')}</select></div>
           <div class="field"><label for="a-level">難度</label><select id="a-level">${[1, 2, 3, 4].map(n => `<option value="${n}"${n === d.level ? ' selected' : ''}>${stars(n)} ${(AJ.LEVEL_NAMES || {})[n] || ''}</option>`).join('')}</select></div>
           <div class="field" style="flex:2 1 180px"><label for="a-tags">標籤（用逗號分隔）</label><input id="a-tags" value="${esc((d.tags || []).join(', '))}"></div></div>
         <div class="field"><label for="a-desc">題目說明</label><textarea id="a-desc" rows="7" style="font-family:var(--font-body)">${esc(d.desc)}</textarea>
@@ -808,6 +960,7 @@ const AV = {
     const bind = (id, fn) => $('#' + id, f).addEventListener('input', e => fn(e.target.value));
     bind('a-title', v => { d.title = v; });
     bind('a-level', v => { d.level = +v; });
+    bind('a-unit', v => { d.unit = v; });
     bind('a-tags', v => { d.tags = v.split(/[,，]/).map(s => s.trim()).filter(Boolean); });
     bind('a-desc', v => { d.desc = v; });
     bind('a-tol', v => { d.tol = Math.max(5, +v || 30); });
@@ -917,10 +1070,61 @@ const AV = {
     if (!d.solution || !d.solution.trim()) return '請填寫參考解答';
     return null;
   },
+  // 匯入題目：貼上 Claude 產生的題目資料（一題或多題），檢查參考解答後發佈
+  importDialog() {
+    const d = openDialog(`<div class="card-h"><h2>匯入題目</h2><span class="spacer"></span><button class="btn small" data-x>關閉</button></div>
+      <div class="card-b">
+        <p class="hint" style="margin:0">把 Claude 給你的題目資料整段貼在下面（可以一次貼好幾題）。系統會先用參考解答跑一次所有測資，確認沒問題才發佈。題號相同的題目會被更新。</p>
+        <textarea id="imp-ta" rows="14" style="width:100%;font-family:var(--font-code);font-size:12.5px" placeholder='{"title": "...", "solution": "...", ...}'></textarea>
+        <div data-log class="hint"></div>
+        <div class="row"><span class="spacer"></span><button class="btn primary" data-go>檢查並發佈</button></div>
+      </div>`, true);
+    $('[data-x]', d.el).addEventListener('click', d.close);
+    $('[data-go]', d.el).addEventListener('click', async () => {
+      const log = $('[data-log]', d.el), btn = $('[data-go]', d.el);
+      let raw = $('#imp-ta', d.el).value.trim().replace(/^```[a-z]*\s*/i, '').replace(/```\s*$/, '');
+      let list;
+      try { list = JSON.parse(raw); } catch (e) { log.innerHTML = `<span style="color:var(--wa)">格式不正確，請確認有完整複製（從第一個 { 或 [ 到最後一個 } 或 ]）。</span>`; return; }
+      if (!Array.isArray(list)) list = [list];
+      btn.disabled = true;
+      const lines = [];
+      const say = s => { lines.push(s); log.innerHTML = lines.join('<br>'); };
+      let ok = 0;
+      for (const [i, q] of list.entries()) {
+        const name = q && q.title ? `「${esc(q.title)}」` : `第 ${i + 1} 題`;
+        try {
+          if (!q || !q.title || !q.solution || !Array.isArray(q.cases) || !q.cases.length || !Array.isArray(q.compare) || !q.compare.length) throw new Error('缺少標題、參考解答、測資或比對項目');
+          let id = String(q.id || '');
+          if (!/^[A-Za-z0-9_-]{2,40}$/.test(id) || S.builtin.some(b => b.id === id)) id = 'p' + Date.now().toString(36) + i;
+          const old = S.custom.find(x => x.id === id);
+          const p = {
+            id, title: String(q.title), level: Math.min(4, Math.max(1, +q.level || 2)), unit: q.unit || 'x', tags: Array.isArray(q.tags) ? q.tags.map(String) : [],
+            desc: String(q.desc || ''), circuit: Array.isArray(q.circuit) ? q.circuit : [], compare: q.compare, tol: +q.tol || 30, step: +q.step || 20,
+            cases: q.cases.map((c, k) => ({ name: String(c.name || `測資 ${k + 1}`), duration: Math.max(200, Math.min(30000, +c.duration || 3000)), events: String(c.events || ''), sample: !!c.sample })),
+            starter: String(q.starter || ''), created: old ? old.created : Date.now() + i, updated: Date.now(),
+          };
+          for (const c of p.cases) { const r = AJ.Judge.parseEvents(c.events); if (r.errors.length) throw new Error(`測資「${c.name}」：${r.errors[0]}`); }
+          say(`${name}：檢查參考解答…`);
+          await new Promise(r => setTimeout(r, 0));
+          p.expected = AJ.Judge.computeExpected(p, String(q.solution));
+          if (JSON.stringify(p).length > 240000) throw new Error('題目資料太大，請縮短測資時間');
+          await S.store.saveProblem(p, String(q.solution));
+          S.expected.delete(p.id);
+          lines[lines.length - 1] = `<span style="color:var(--ac)">✔ ${name} 已${old ? '更新' : '發佈'}</span>`;
+          log.innerHTML = lines.join('<br>');
+          ok++;
+        } catch (e) {
+          say(`<span style="color:var(--wa)">✘ ${name}：${esc(e.message)}</span>`);
+        }
+      }
+      btn.disabled = false;
+      if (ok) { toast(`已發佈 ${ok} 題`); this.list(); }
+    });
+  },
   problemObj() {
     const d = this.draft;
     return {
-      id: d.id, title: d.title.trim(), level: d.level || 1, tags: d.tags || [], desc: d.desc || '',
+      id: d.id, title: d.title.trim(), level: d.level || 1, unit: d.unit || 'x', tags: d.tags || [], desc: d.desc || '',
       circuit: d.circuit, compare: d.compare, tol: d.tol || 30, step: d.step || 20,
       cases: d.cases.map(c => ({ name: c.name || '', duration: c.duration, events: c.events || '', sample: !!c.sample })),
       starter: d.starter || '', created: d.created || Date.now(), updated: Date.now(),
@@ -963,6 +1167,162 @@ const AV = {
   },
 };
 
+/* ================================================================ 班級管理（帳號模式） */
+const CV = {
+  cid: null,
+  async render() {
+    const host = $('#v-classes');
+    const st = S.store;
+    if (!st || st.mode !== 'account') { host.innerHTML = '<div class="card"><div class="empty">班級管理需要設定 Google 登入（config.js 的 googleClientId）。</div></div>'; return; }
+    if (!st.isTeacher) { teacherOnly(host, '班級管理', () => this.render()); return; }
+    host.innerHTML = `<div class="authoring">
+      <div class="col">
+        <section class="card"><div class="card-h"><h2>我的班級</h2></div><div class="card-b plist" data-list><p class="muted">讀取中…</p></div>
+          <form class="card-b" data-create style="border-top:1px solid var(--line);display:flex;flex-direction:column;gap:8px">
+            <div class="field"><label for="cv-new">新增班級</label><input id="cv-new" placeholder="例如 301" required maxlength="30"></div>
+            <label style="font-size:14px;display:flex;gap:6px;align-items:center"><input type="checkbox" id="cv-open" checked> 開放學生用代碼自行加入</label>
+            <button class="btn primary">${I.plus}建立班級</button></form></section>
+      </div>
+      <div class="col"><section class="card" data-detail><div class="empty">選擇左邊的班級，或建立新班級。</div></section>
+        <section class="card" data-legacy></section></div></div>`;
+    $('[data-create]', host).addEventListener('submit', async e => {
+      e.preventDefault();
+      try {
+        const c = await st.api('/api/class/create', { name: $('#cv-new', host).value.trim(), allowJoin: $('#cv-open', host).checked });
+        toast(`已建立 ${c.name}，加入代碼 ${c.code}`);
+        $('#cv-new', host).value = '';
+        this.cid = c.id;
+        await this.loadList();
+        this.legacy();
+      } catch (err) { toast(err.message); }
+    });
+    await this.loadList();
+    this.legacy();
+  },
+  async loadList() {
+    const box = $('#v-classes [data-list]');
+    try { this.classes = await S.store.api('/api/classes'); }
+    catch (e) { box.innerHTML = `<p class="muted">讀取失敗：${esc(e.message)}</p>`; return; }
+    if (!this.classes.length) { box.innerHTML = '<p class="muted" style="margin:0">還沒有班級，先在下面建立一個。</p>'; return; }
+    box.innerHTML = this.classes.map(c => `<button class="prow" data-id="${esc(c.id)}"${c.id === this.cid ? ' aria-current="true"' : ''}><span class="no">${c.count} 人</span><span class="tt">${esc(c.name)}${c.archived ? ' <span class="tag">已封存</span>' : ''}</span><span class="muted" style="font-family:var(--font-code);font-size:12px">${esc(c.code)}</span></button>`).join('');
+    $$('.prow', box).forEach(b => b.addEventListener('click', () => { this.cid = b.dataset.id; this.loadList(); }));
+    if (this.cid) this.detail();
+  },
+  async detail() {
+    const st = S.store, c = this.classes.find(x => x.id === this.cid);
+    const box = $('#v-classes [data-detail]');
+    if (!c) return;
+    box.innerHTML = `<div class="card-h"><h2>${esc(c.name)}</h2><span class="muted" style="font-family:var(--font-code);font-size:12px">${esc(c.id)}</span><span class="spacer"></span>
+        <button class="btn small" data-rename>改名</button><button class="btn small" data-archive>${c.archived ? '取消封存' : '封存'}</button></div>
+      <div class="card-b" style="display:flex;flex-direction:column;gap:14px">
+        <div class="row" style="align-items:center;gap:16px">
+          <div><div class="lb" style="font-size:13px;color:var(--muted)">加入代碼</div><div style="font-family:var(--font-code);font-size:30px;font-weight:600;letter-spacing:.18em">${esc(c.code)}</div></div>
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <label style="font-size:14px;display:flex;gap:6px;align-items:center"><input type="checkbox" data-open${c.allowJoin ? ' checked' : ''}> 開放學生自行加入（名單上沒有的座號也能加入）</label>
+            <div class="row"><button class="btn small" data-newcode>換新代碼</button><button class="btn small" data-copycode>複製代碼</button></div></div>
+        </div>
+        <p class="hint" style="margin:0">學生用 Google 帳號登入後，輸入這個代碼、座號、姓名就會加入。名單上已有的座號，姓名必須相同才能綁定。目前 ${c.bound} / ${c.count} 位已登入綁定。</p>
+        <div><div class="sub" style="margin-top:0">學生名單</div><div class="tbl-wrap" data-members><p class="muted">讀取中…</p></div></div>
+        <div class="field"><label for="cv-paste">貼上名單（從 Excel 複製「座號、姓名、Email」，Email 可以不填）</label>
+          <textarea id="cv-paste" rows="5" placeholder="1&#9;王小明&#10;2&#9;李小華&#9;s30102@nehs.cyc.edu.tw"></textarea>
+          <div class="row"><span class="hint">同一個座號會更新姓名；Email 空白時保留原本的綁定。</span><span class="spacer"></span><button class="btn primary" data-paste>匯入名單</button></div></div>
+        <div><div class="sub" style="margin-top:0">本班開放的題目與必做題</div><div data-probs></div></div>
+        <div class="row"><span class="hint">Google 試算表裡的「成績_${esc(c.name)}（${esc(c.id)}）」分頁會在學生送出時自動更新；資料看起來不對時可以重建。</span><span class="spacer"></span><button class="btn small" data-rebuild>重建試算表成績分頁</button></div>
+      </div>`;
+    const act = async (fn, okMsg) => { try { await fn(); if (okMsg) toast(okMsg); await this.loadList(); } catch (e) { toast(e.message); } };
+    $('[data-open]', box).addEventListener('change', e => act(() => st.api('/api/class/update', { cid: c.id, allowJoin: e.target.checked }), e.target.checked ? '已開放自行加入' : '已關閉自行加入'));
+    $('[data-newcode]', box).addEventListener('click', () => act(() => st.api('/api/class/update', { cid: c.id, newCode: true }), '已更換代碼，舊代碼不能再使用'));
+    $('[data-copycode]', box).addEventListener('click', () => copyText(c.code));
+    $('[data-archive]', box).addEventListener('click', () => act(() => st.api('/api/class/update', { cid: c.id, archived: !c.archived }), c.archived ? '已取消封存' : '已封存：學生暫時無法送出這個班級的成績'));
+    $('[data-rename]', box).addEventListener('click', () => {
+      const d = openDialog(`<div class="card-h"><h2>班級改名</h2></div><form class="card-b"><div class="field"><label for="rn-n">班級名稱</label><input id="rn-n" value="${esc(c.name)}" maxlength="30" required></div><div class="row"><span class="spacer"></span><button type="button" class="btn" data-x>取消</button><button class="btn primary">儲存</button></div></form>`);
+      $('[data-x]', d.el).addEventListener('click', d.close);
+      $('form', d.el).addEventListener('submit', e => { e.preventDefault(); const n = $('#rn-n', d.el).value.trim(); d.close(); act(() => st.api('/api/class/update', { cid: c.id, name: n }), '已改名'); });
+    });
+    $('[data-paste]', box).addEventListener('click', () => act(async () => {
+      const r = await st.api('/api/class/members/save', { cid: c.id, text: $('#cv-paste', box).value });
+      toast(`新增 ${r.added} 位、更新 ${r.updated} 位`);
+    }));
+    $('[data-rebuild]', box).addEventListener('click', () => act(() => st.api('/api/sheet/rebuild', { cid: c.id }), '已重建試算表的成績分頁'));
+    this.members(c);
+    this.probs(c);
+  },
+  probs(c) {
+    const st = S.store, box = $('#v-classes [data-probs]');
+    const hidden = new Set(c.hidden || []), required = new Set(c.required || []);
+    const all = S.allProblems || S.problems;
+    const units = [];
+    all.forEach(p => { const u = unitOf(p); let g = units.find(x => x.u === u); if (!g) units.push(g = { u, list: [] }); g.list.push(p); });
+    box.innerHTML = `<p class="hint" style="margin:0 0 8px">取消「開放」的題目，這個班的學生就看不到；勾「必做」的題目會在學生的題目列表最上方列出，並顯示完成進度。</p>
+      ${units.map((g, gi) => `<div class="casebox" style="margin-bottom:8px"><div class="row" style="align-items:center"><b>${esc(unitName(g.u))}</b><span class="spacer"></span>
+        <button class="btn small" data-all="${gi}" data-v="1">全部開放</button><button class="btn small" data-all="${gi}" data-v="0">全部隱藏</button></div>
+        <table class="tbl"><thead><tr><th style="width:56px">開放</th><th style="width:56px">必做</th><th>題目</th><th>難度</th></tr></thead><tbody>
+        ${g.list.map(p => `<tr data-g="${gi}"><td><input type="checkbox" data-open="${esc(p.id)}"${hidden.has(p.id) ? '' : ' checked'} aria-label="開放 ${esc(p.title)}"></td>
+          <td><input type="checkbox" data-req="${esc(p.id)}"${required.has(p.id) ? ' checked' : ''} aria-label="必做 ${esc(p.title)}"></td><td>${esc(p.title)}</td><td class="level">${stars(p.level)}</td></tr>`).join('')}
+        </tbody></table></div>`).join('')}
+      <div class="row"><span class="hint" data-cnt></span><span class="spacer"></span><button class="btn primary" data-saveprobs>儲存題目設定</button></div>`;
+    const count = () => {
+      const o = $$('[data-open]', box).filter(x => x.checked).length, r = $$('[data-req]', box).filter(x => x.checked).length;
+      $('[data-cnt]', box).textContent = `開放 ${o} 題，必做 ${r} 題`;
+    };
+    $$('[data-req]', box).forEach(x => x.addEventListener('change', () => { if (x.checked) $(`[data-open="${CSS.escape(x.dataset.req)}"]`, box).checked = true; count(); }));
+    $$('[data-open]', box).forEach(x => x.addEventListener('change', () => { if (!x.checked) $(`[data-req="${CSS.escape(x.dataset.open)}"]`, box).checked = false; count(); }));
+    $$('[data-all]', box).forEach(b => b.addEventListener('click', () => {
+      $$(`tr[data-g="${b.dataset.all}"] [data-open]`, box).forEach(x => { x.checked = b.dataset.v === '1'; x.dispatchEvent(new Event('change')); });
+    }));
+    $('[data-saveprobs]', box).addEventListener('click', async () => {
+      const h = $$('[data-open]', box).filter(x => !x.checked).map(x => x.dataset.open);
+      const r = $$('[data-req]', box).filter(x => x.checked).map(x => x.dataset.req);
+      try { await st.api('/api/class/update', { cid: c.id, hidden: h, required: r }); toast('已儲存，學生重新整理後就會看到'); await this.loadList(); }
+      catch (e) { toast(e.message); }
+    });
+    count();
+  },
+  async members(c) {
+    const st = S.store, box = $('#v-classes [data-members]');
+    let list;
+    try { list = await st.api('/api/class/members', { cid: c.id }); } catch (e) { box.innerHTML = esc(e.message); return; }
+    if (!list.length) { box.innerHTML = '<p class="muted" style="margin:0">名單是空的。可以在下面貼上名單，或開放學生自行加入。</p>'; return; }
+    box.innerHTML = `<table class="tbl"><thead><tr><th>座號</th><th>姓名</th><th>Google 帳號</th><th></th></tr></thead><tbody>${list.map(m => `<tr><td>${m.seat}</td><td>${esc(m.name)}</td><td>${m.email ? esc(m.email) : '<span class="muted">尚未登入</span>'}</td>
+      <td style="white-space:nowrap">${m.email ? `<button class="btn small" data-unbind="${m.seat}" title="學生用錯帳號登入時使用">解除綁定</button>` : ''} <button class="btn small danger" data-rm="${m.seat}">刪除</button></td></tr>`).join('')}</tbody></table>`;
+    $$('[data-unbind]', box).forEach(b => b.addEventListener('click', async () => {
+      try { await st.api('/api/class/members/remove', { cid: c.id, seat: +b.dataset.unbind, unbind: true }); toast('已解除綁定，學生可以用正確的帳號重新加入'); this.members(c); } catch (e) { toast(e.message); }
+    }));
+    $$('[data-rm]', box).forEach(b => b.addEventListener('click', async () => {
+      if (b.dataset.arm !== '1') { b.dataset.arm = '1'; b.textContent = '確定刪除？'; setTimeout(() => { if (b.isConnected) { b.dataset.arm = ''; b.textContent = '刪除'; } }, 3000); return; }
+      try { await st.api('/api/class/members/remove', { cid: c.id, seat: +b.dataset.rm }); toast('已從名單刪除（作答紀錄保留在試算表）'); await this.loadList(); } catch (e) { toast(e.message); }
+    }));
+  },
+  async legacy() {
+    const st = S.store, box = $('#v-classes [data-legacy]');
+    let d;
+    try { d = await st.api('/api/legacy'); } catch (e) { box.innerHTML = `<div class="card-b muted">${esc(e.message)}</div>`; return; }
+    if (!d.groups.length) { box.innerHTML = '<div class="card-h"><h3>整合舊的作答紀錄</h3></div><div class="card-b"><p class="muted" style="margin:0">沒有需要整合的舊紀錄。</p></div>'; return; }
+    const olds = {};
+    d.groups.forEach(g => (olds[g.cls] = olds[g.cls] || []).push(g));
+    const opts = sel => '<option value="">（不整合）</option>' + d.classes.filter(c => !c.archived).map(c => `<option value="${esc(c.id)}"${c.name.replace(/\s|班/g, '') === sel.replace(/\s|班/g, '') ? ' selected' : ''}>${esc(c.name)}</option>`).join('');
+    box.innerHTML = `<div class="card-h"><h3>整合舊的作答紀錄</h3><span class="muted" style="font-size:13px">${d.groups.reduce((s, g) => s + g.count, 0)} 筆</span></div>
+      <div class="card-b" style="display:flex;flex-direction:column;gap:12px">
+        <p class="hint" style="margin:0">這些是改用 Google 登入之前，學生自己填「班級、座號、姓名」送出的紀錄。選好每個舊班級要併入哪個新班級，系統會依座號對應；名單上沒有的座號會用舊紀錄的姓名自動加入名單。</p>
+        ${Object.entries(olds).map(([cls, gs], i) => `<div class="casebox"><div class="row" style="align-items:center"><b>舊班級「${esc(cls || '（空白）')}」</b><span class="muted" style="font-size:13px">${gs.length} 人、${gs.reduce((s, g) => s + g.count, 0)} 筆</span><span class="spacer"></span>
+          <label for="lg-${i}" style="font-size:13px">併入</label><select id="lg-${i}" data-old="${esc(cls)}">${opts(cls)}</select></div>
+          <div style="font-size:13px;color:var(--muted)">${gs.sort((a, b) => a.seat - b.seat).map(g => `${g.seat} 號 ${esc(g.names.join('／'))}（${g.count}）`).join('、')}</div></div>`).join('')}
+        <div class="row"><span class="spacer"></span><button class="btn primary" data-apply>整合</button></div>
+      </div>`;
+    $('[data-apply]', box).addEventListener('click', async () => {
+      const map = {};
+      $$('select[data-old]', box).forEach(s => { if (s.value) map[s.dataset.old] = s.value; });
+      if (!Object.keys(map).length) { toast('請至少選一個要併入的班級'); return; }
+      try {
+        const r = await st.api('/api/legacy/apply', { map });
+        toast(`已整合 ${r.moved} 筆紀錄，名單新增 ${r.added} 位`);
+        await this.loadList(); this.legacy();
+        if (st.reloadAll) st.reloadAll();
+      } catch (e) { toast(e.message); }
+    });
+  },
+};
+
 /* ================================================================ 啟動 */
 async function boot() {
   shell();
@@ -984,11 +1344,17 @@ async function boot() {
     if (S.view === 'grades') GV.table();
   });
   store.on('mine', m => { S.mine = m || {}; PV.refreshStatus(); });
+  store.on('user', () => {
+    S.profile = store.profile; updateChrome();
+    rebuildProblems();
+    if (!S.problems.some(p => p.id === S.pid) && S.problems[0]) PV.open(S.problems[0].id);
+    PV.renderPicker();
+  });
   try { await store.init(); } catch (e) { console.error(e); store.error = '初始化失敗：' + e.message; }
   S.profile = store.profile || S.profile;
   const want = LS.get('aj.view', 'problems');
-  if ((want === 'grades' || want === 'author') && (store.isTeacher || store.mode === 'sheet')) setView(want);
-  else if (S.view === 'grades' || S.view === 'author') setView('problems');
+  if ((want === 'grades' || want === 'author' || want === 'classes') && (store.isTeacher || (store.mode === 'sheet' && want !== 'classes'))) setView(want);
+  else if (S.view === 'grades' || S.view === 'author' || S.view === 'classes') setView('problems');
   updateChrome();
   if (pid && problemById(pid) && pid !== S.pid) PV.open(pid);
 }

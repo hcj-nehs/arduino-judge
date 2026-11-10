@@ -365,7 +365,7 @@ class SimRunner {
       M.wallStart = t0; M.wallLimit = 1500;
       M.runUntil(this.clock);
       if (M.t > this.clock + 5e6 && !M.done) { /* 很長的 delay：時鐘正常前進即可 */ }
-      this.bench.update(M.snapshot(), true);
+      this.bench.update(M.snapshot(this.clock), true);
       if (this.hooks.onTick) this.hooks.onTick(Math.min(M.t, this.clock));
       if (M.error) {
         this.running = false;
